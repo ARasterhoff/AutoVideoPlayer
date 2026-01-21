@@ -1,0 +1,322 @@
+================================================================================
+                    AUTOVIDEOPLAYER - DESIGN DOCUMENTATIE
+================================================================================
+
+OVERZICHT
+---------
+BetterDiscord plugin die video's automatisch afspeelt wanneer ze in beeld komen
+en pauzeert wanneer ze uit beeld scrollen. Werkt specifiek met Discord's video
+player structuur.
+
+
+================================================================================
+                              DATA STRUCTUREN
+================================================================================
+
+WeakSet (manuallyPausedVideos / finishedVideos)
+-----------------------------------------------
+Waarom WeakSet ipv Set of Array:
+- WeakSet houdt "zwakke" referenties naar objecten
+- Wanneer video element uit DOM verdwijnt (bv. door scrollen in Discord),
+  wordt het automatisch garbage collected
+- Bij normale Set/Array blijven referenties bestaan = memory leak
+- Discord laadt/verwijdert constant elementen bij scrollen, dus cruciaal
+- Nadeel: niet itereerbaar, maar dat is hier niet nodig
+
+Waarom geen Map met video ID's:
+- Discord video elementen hebben geen stabiele ID's
+- Element referentie is betrouwbaarder
+- WeakSet is perfect voor "heeft dit element eigenschap X" checks
+
+
+================================================================================
+                               FUNCTIES
+================================================================================
+
+constructor()
+-------------
+Doel: Initialiseer plugin state en laad instellingen
+
+Werking:
+- Zet alle observers/intervals op null (voor cleanup tracking)
+- Definieert defaultSettings als fallback
+- Merged opgeslagen settings met defaults via Object.assign()
+- Object.assign() zorgt dat nieuwe settings in updates niet crashen
+
+BdApi.Data.load(): BetterDiscord's persistente opslag API
+
+
+--------------------------------------------------------------------------------
+
+start()
+-------
+Doel: Plugin activeren, alle monitoring starten
+
+Volgorde is belangrijk:
+1. setupIntersectionObserver - moet eerst, andere functies gebruiken deze
+2. observeNewVideos - start DOM watching voor nieuwe content
+3. processExistingVideos - pak video's die al geladen waren
+4. startPlayingVideoCheck - backup mechanisme
+
+Waarom processExistingVideos apart:
+- MutationObserver ziet alleen NIEUWE nodes
+- Bij plugin enable kunnen er al video's op scherm staan
+
+
+--------------------------------------------------------------------------------
+
+stop()
+------
+Doel: Cleanup bij plugin disable, voorkom memory leaks
+
+Checkt of elke observer/interval bestaat voor disconnect:
+- Plugin kan gestopt worden voordat alles geinitialiseerd is
+- Zet references naar null voor garbage collection
+
+Waarom belangrijk:
+- Observers blijven anders actief op achtergrond
+- Intervals blijven tikken
+- BetterDiscord kan plugins aan/uit zetten, moet clean zijn
+
+
+--------------------------------------------------------------------------------
+
+setupIntersectionObserver()
+---------------------------
+Doel: Maak observer die detecteert wanneer video's in/uit viewport komen
+
+IntersectionObserver voordelen boven scroll events:
+- Browser-native, zeer performant
+- Geen throttling/debouncing nodig
+- Automatische threshold berekening
+- Werkt ook bij resize, zoom, etc.
+
+Threshold conversie (50 -> 0.5):
+- Settings zijn user-friendly percentages
+- API verwacht 0-1 decimaal
+
+entry.isIntersecting:
+- true = element komt viewport binnen (of is er al)
+- false = element verlaat viewport
+
+
+--------------------------------------------------------------------------------
+
+clickPlayPauseButton(video, shouldPlay)
+---------------------------------------
+Doel: Video starten/stoppen via Discord's eigen UI knoppen
+
+Waarom Discord knoppen klikken ipv video.play()/pause():
+- Discord's UI moet in sync blijven (play/pause icoon, progress bar)
+- Discord heeft eigen event handlers die moeten triggeren
+- Directe video.play() kan Discord UI in incorrecte state laten
+
+Multi-attachment detectie:
+- Discord gebruikt CSS grid classes voor layout
+- "GridSingle" = enkele attachment
+- "GridMosaic" = meerdere attachments
+- Skip multi-attachment: te druk, gebruiker wil zelf kiezen
+
+Knop prioriteit:
+1. playCover - grote overlay bij ongespeelde video
+2. replayButton - na video einde
+3. playButton - normale play in controls
+4. fallback - direct video.play() als niets werkt
+
+.catch(() => {}) bij video.play():
+- Browsers kunnen autoplay blokkeren
+- Zonder catch krijg je console errors
+- Empty catch is intentioneel, falen is acceptabel
+
+
+--------------------------------------------------------------------------------
+
+observeNewVideos()
+------------------
+Doel: Detecteer nieuwe video elementen in DOM
+
+MutationObserver config:
+- childList: true - watch voor toegevoegde/verwijderde nodes
+- subtree: true - hele DOM tree, niet alleen directe children
+
+Waarom document.body observen:
+- Discord's content zit diep genest
+- Weten niet exact waar video's komen
+- Body vangt alles
+
+querySelectorAll?.() met optional chaining:
+- Sommige nodes hebben geen querySelectorAll (text nodes)
+- Voorkomt crashes
+
+Dubbele check (videos in node + node zelf):
+- Node kan container zijn met video's erin
+- Node kan zelf video element zijn
+
+
+--------------------------------------------------------------------------------
+
+processExistingVideos()
+-----------------------
+Doel: Verwerk video's die al bestonden bij plugin start
+
+Simpele document.querySelectorAll("video"):
+- Pakt ALLE video's op pagina
+- isMessageVideo() filtert relevante eruit
+
+Waarom nodig:
+- MutationObserver ziet alleen nieuwe nodes
+- User kan plugin enablen terwijl video's al zichtbaar zijn
+
+
+--------------------------------------------------------------------------------
+
+isMessageVideo(video)
+---------------------
+Doel: Filter video's die in berichten zitten vs UI elementen
+
+Discord structuur check:
+1. wrapper - Discord's video wrapper component
+2. mediaContainer - specifieke media containers voor attachments
+3. accessoriesContainer - message accessories (embeds, attachments)
+
+Waarom 3 checks:
+- Voorkomt false positives op UI video's
+- Discord kan video's gebruiken voor andere doeleinden
+- Alleen bericht-video's zijn relevant voor autoplay
+
+Return early pattern:
+- Zodra een check faalt, return false
+- Efficienter dan alle checks doen
+
+
+--------------------------------------------------------------------------------
+
+observeVideo(video)
+-------------------
+Doel: Setup tracking en click handling voor specifieke video
+
+Overlay uitleg:
+- Onzichtbare div over video (behalve controls)
+- Vangt clicks op voordat Discord ze krijgt
+- Voorkomt dat Discord fullscreen/gallery opent bij klik
+- height: calc(100% - 64px) laat control bar vrij
+
+Waarom overlay nodig:
+- Discord opent normaal media viewer bij klik op video
+- Wij willen play/pause toggle
+- Overlay intercepteert clicks
+
+position: relative op wrapper:
+- Nodig voor absolute positioning van overlay
+- Sommige wrappers hebben position: static
+
+Event listeners (pause/play/ended):
+- Tracking voor debugging
+- ended event voor auto-replay functionaliteit
+
+setTimeout bij auto-replay (100ms):
+- Discord moet eerst UI updaten naar replay state
+- Te snel klikken = knop bestaat nog niet
+
+
+--------------------------------------------------------------------------------
+
+isVideoInViewport(video)
+------------------------
+Doel: Check of video momenteel zichtbaar is
+
+getBoundingClientRect():
+- Geeft positie/grootte relatief aan viewport
+- Live waarde, geen caching nodig
+
+Viewport dimensies fallback:
+- window.innerHeight is modern
+- document.documentElement.clientHeight is fallback
+- Compatibiliteit met oudere browsers
+
+Simpele bounds check:
+- top < windowHeight = bovenkant is boven onderkant scherm
+- bottom > 0 = onderkant is onder bovenkant scherm
+- Beide = minimaal deels zichtbaar
+
+
+--------------------------------------------------------------------------------
+
+startPlayingVideoCheck()
+------------------------
+Doel: Backup mechanisme voor gemiste video's
+
+Waarom nodig naast IntersectionObserver:
+- Snel scrollen kan events missen
+- Edge cases bij resize/zoom
+- Belt-and-suspenders approach
+
+500ms interval:
+- Vaak genoeg om snel te reageren
+- Niet zo vaak dat het performance kost
+- Alleen actieve video's worden gecheckt (niet paused/ended)
+
+
+--------------------------------------------------------------------------------
+
+getSettingsPanel()
+------------------
+Doel: BetterDiscord settings UI genereren
+
+BdApi.UI.buildSettingsPanel():
+- BetterDiscord's declaratieve settings API
+- Automatische UI generatie uit config object
+
+Categories:
+- Groepering voor overzichtelijkheid
+- collapsible: true = kan ingeklapt worden
+
+onChange handler:
+- Wordt gecalled bij elke setting wijziging
+- Slaat direct op naar persistent storage
+- Threshold change triggert restart (observer moet opnieuw met nieuwe threshold)
+
+
+================================================================================
+                           DISCORD SPECIFIEK
+================================================================================
+
+Class selectors met [class*="..."]:
+- Discord gebruikt CSS modules met random suffixes
+- class*= matched partial classnames
+- Bijv: "wrapper_a1b2c3" matched op [class*="wrapper"]
+
+aria-label selectors:
+- Discord buttons hebben aria-labels voor accessibility
+- Stabielere selector dan classes
+- "Play", "Pause", "Play again" zijn consistent
+
+
+================================================================================
+                              PERFORMANCE
+================================================================================
+
+Waarom dit design performant is:
+1. IntersectionObserver is browser-native en geoptimaliseerd
+2. WeakSet voorkomt memory leaks
+3. MutationObserver is efficienter dan polling
+4. Backup interval checkt alleen actieve video's
+5. Early returns in functies voorkomen onnodige werk
+
+
+================================================================================
+                            EDGE CASES
+================================================================================
+
+Afgehandelde edge cases:
+- Plugin enable terwijl video's al bestaan
+- Video element zonder wrapper (fallback naar direct play/pause)
+- Multi-attachment berichten (skip)
+- Handmatig gepauzeerde video's (respecteren)
+- Video's die klaar zijn met afspelen (optioneel replay)
+- Snel scrollen (backup interval)
+- DOM cleanup door Discord (WeakSet)
+- Browser autoplay blocking (catch op play())
+
+
+================================================================================
